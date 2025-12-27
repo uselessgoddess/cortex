@@ -3,432 +3,346 @@
 ## Summary
 
 Reviewed: ARCHITECTURE.md for RAG-based LLM engine for AI-Dungeon style DnD5e roguelike.
-Target: 16GB VRAM, quantized Qwen2.5-14B-Instruct.
+Target: 16GB VRAM, local LLM inference.
 
-**Verdict**: Feasible with modifications. Core concepts are sound. Several Rust patterns need refinement.
+**Verdict**: Feasible. Core spreading activation RAG concept is solid. Model selection requires careful consideration for context budget.
 
 ---
 
-## 1. Hardware Feasibility
+## 1. Hardware Feasibility & Model Selection
 
-### VRAM Budget Analysis (16GB)
+### Context Budget Problem
 
-| Component | VRAM Estimate |
-|-----------|---------------|
-| Qwen2.5-14B Q4_K_M | ~8.5GB |
-| KV cache (4k context) | ~1.5GB |
-| KV cache (8k context) | ~3GB |
+With a 4k context window, the budget splits approximately:
+- ~2500 tokens for context (facts, world state, characters)
+- ~1500 tokens for response
+
+**This is insufficient for complex fantasy scenarios.** A typical scenario requires:
+
+| Context Component | Token Estimate |
+|-------------------|----------------|
+| System prompt + response schema | ~300-500 |
+| Current event description | ~100-200 |
+| World state (time, location, weather) | ~50-100 |
+| Active characters (2-4 NPCs) | ~200-400 |
+| Relevant facts from knowledge graph | ~500-1500 |
+| Dialogue history (last 2-3 turns) | ~300-600 |
+| **Total context needed** | **~1500-3300** |
+| Reserved for response | ~1000-2000 |
+| **Minimum practical context** | **~3000-5000** |
+
+For complex scenarios (combat with multiple participants, revelation moments, branching dialogue):
+- Need ~4000-6000 tokens context
+- Need ~1500-2500 tokens response
+- **Minimum practical window: 6k-8k tokens**
+
+### Model Comparison (16GB VRAM)
+
+| Model | Params | Q4_K_M Size | Max Practical Context | Quality |
+|-------|--------|-------------|----------------------|---------|
+| Qwen2.5-14B | 14B | ~8.5GB | 4-6k (tight) | High |
+| Qwen2.5-7B | 7B | ~4.5GB | 8-16k (comfortable) | Medium-High |
+| Ministral-8B | 8B | ~5GB | 8-32k (comfortable) | Medium-High |
+| Ministral-3B | 3B | ~2GB | 16-64k (very comfortable) | Medium |
+
+### Recommendation: Ministral-8B or Qwen2.5-7B
+
+**Why not Qwen2.5-14B?**
+- At Q4_K_M (~8.5GB), leaves only ~7.5GB for KV cache
+- 8k context KV cache needs ~3GB, leaving ~4.5GB headroom
+- Complex scenarios will hit VRAM ceiling, causing swap to RAM (5-20x slowdown)
+
+**Why Ministral-8B?**
+- Native 256k context window (can use 16-32k comfortably)
+- Q4_K_M fits in ~5GB, leaves ~11GB for KV cache
+- 16k context with 8B model: ~2.5GB KV cache
+- **Total: ~7.5GB with 16k context - plenty of headroom**
+- Apache 2.0 license, optimized for edge deployment
+
+**Why Qwen2.5-7B as alternative?**
+- Strong multilingual support (29+ languages)
+- Excellent at structured JSON output
+- Good balance of quality vs context capacity
+
+### VRAM Budget (Recommended Setup)
+
+| Component | VRAM (Ministral-8B Q4_K_M) |
+|-----------|---------------------------|
+| Model weights | ~5GB |
+| KV cache (16k context) | ~2.5GB |
+| KV cache (32k context) | ~5GB |
 | Overhead/buffers | ~1GB |
-| **Total (4k ctx)** | **~11GB** |
-| **Total (8k ctx)** | **~13GB** |
+| **Total (16k ctx)** | **~8.5GB** |
+| **Total (32k ctx)** | **~11GB** |
 
-**Assessment**: Workable. Use 4k-6k context windows. 8k possible but tight.
-
-### Recommendations
-
-- Set `num_ctx: 4096` in Ollama config as baseline
-- Use GGUF Q4_K_M quantization (best quality/size ratio)
-- Consider Q5_K_M if VRAM allows (~10GB model)
-- Flash attention is mandatory (Ollama enables by default)
-- Context window is your main constraint - the spreading activation approach addresses this well
+**Assessment**: 16k context is comfortable. 32k possible. This solves the context budget problem.
 
 ---
 
-## 2. Architectural Concerns
+## 2. Core Architectural Concepts
 
-### 2.1 Entity ID Design
+### 2.1 Spreading Activation RAG
 
-**Issue**: `EntityId(pub u32)` is exposed as public, uses `u32` inconsistently with `FactId(pub u32)`.
+The knowledge graph uses spreading activation to find relevant facts. This is the right approach for:
+- Limited context windows (retrieves only what's needed)
+- Associative memory (finds related facts through connections)
+- Emergent narrative (unexpected connections surface naturally)
 
-**Current**:
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct EntityId(pub u32);
+**Key insight**: This is not a traditional vector-based RAG. Tag associations form a semantic graph where energy flows from trigger tags to related concepts. The architecture correctly prioritizes graph traversal over embedding similarity.
+
+### 2.2 Event-Driven Pipeline
+
+```
+GameEvent → ContextAssembler → LLM → ToolExecutor → Response
+                ↓                        ↓
+           KnowledgeGraph ←──────────────┘
 ```
 
-**Problem**: Mixing `u32` for entity IDs but `FactId` also uses `u32`. The `add_knowledge_fact` tool shows `FactId(Uuid::new_v4())` - contradicts the struct definition.
+**Strength**: Clean separation. The core processes events without controlling game flow.
 
-**Fix**:
-```rust
-use std::num::NonZeroU32;
+**Consideration**: Async boundary with Bevy needs careful handling. Use `bevy_tokio_tasks` or channels rather than blocking runtime.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[repr(transparent)]
-pub struct EntityId(NonZeroU32);
+### 2.3 Typed Response System
 
-impl EntityId {
-    pub fn new(id: u32) -> Option<Self> {
-        NonZeroU32::new(id).map(Self)
-    }
+The architecture defines typed responses (`DialogueResponse`, `CombatResponse`, `DescriptionResponse`) rather than free-form text.
 
-    pub fn get(self) -> u32 {
-        self.0.get()
-    }
-}
-```
+**Benefits**:
+- Structured output for game integration
+- JSON schema guides LLM output
+- Validation catches malformed responses
 
-Benefits: niche optimization for `Option<EntityId>`, prevents zero IDs.
-
-### 2.2 HashMap vs IndexMap
-
-**Issue**: Using `HashMap<Tag, ...>` for knowledge graph traversal.
-
-**Problem**: Non-deterministic iteration order affects spreading activation results between runs.
-
-**Fix**:
-```rust
-use indexmap::IndexMap;
-
-pub struct KnowledgeGraph {
-    facts: IndexMap<FactId, Fact>,
-    tag_to_facts: IndexMap<Tag, HashSet<FactId>>,
-    associations: IndexMap<Tag, Vec<Association>>,
-    // ...
-}
-```
-
-### 2.3 Async Runtime Conflict
-
-**Issue**: `NarrativeCore::process_event` uses `runtime.block_on()` inside a potentially async context.
-
-```rust
-impl NarrativeCore {
-    pub fn process_event(&mut self, event: GameEvent, world_state: &WorldState) -> NarrativeResponse {
-        self.runtime.block_on(
-            self.processor.process_event(event, world_state)
-        ).expect("Narrative processing failed")
-    }
-}
-```
-
-**Problem**: Will panic if called from async context. Bevy uses its own runtime.
-
-**Fix**: Use channels or spawn blocking:
-```rust
-pub fn process_event(&self, event: GameEvent, world_state: &WorldState) -> impl Future<Output = NarrativeResponse> {
-    let processor = self.processor.clone();
-    let world_state = world_state.clone();
-    async move {
-        processor.process_event(event, &world_state).await
-            .expect("Narrative processing failed")
-    }
-}
-```
-
-Or use `bevy_tokio_tasks` crate for proper integration.
-
-### 2.4 Missing Error Types
-
-**Issue**: `StorageError` is used but never defined.
-
-**Fix**:
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum StorageError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Serialization error: {0}")]
-    Bincode(#[from] bincode::Error),
-
-    #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
-}
-```
-
-### 2.5 Tool Implementation Inconsistency
-
-**Issue**: `ToolCall` in response types conflicts with `ToolCall` from Ollama response.
-
-**Current** (two definitions):
-```rust
-// In llm_interface/response_types.rs
-pub struct DialogueResponse {
-    pub tool_calls: Vec<ToolCall>,  // But ToolCall not defined here
-}
-
-// In llm_interface/ollama.rs
-pub struct ToolCall {
-    pub function: FunctionCall,
-}
-```
-
-**Fix**: Single definition, re-export:
-```rust
-// llm_interface/mod.rs
-mod types;
-mod ollama;
-
-pub use types::*;
-pub use ollama::ToolCall;  // Re-export
-```
+**Consideration**: Add fallback to graceful degradation. When LLM returns invalid JSON, fall back to templated responses rather than crashing.
 
 ---
 
-## 3. Rust Style Issues
+## 3. Architectural Gaps
 
-### 3.1 Avoid `todo!()` in Production Code
+### 3.1 Token Budget Management
 
-**Issue**: `DiceExpr::parse` has `todo!()`.
+**Missing**: No mechanism to ensure assembled context fits in context window.
 
-**Fix**: Implement or return `Option`:
-```rust
-impl DiceExpr {
-    pub fn parse(s: &str) -> Option<Self> {
-        let s = s.trim();
-        let (count, rest) = s.split_once('d')?;
-        let count: u8 = count.parse().ok()?;
+**Solution concept**:
+1. Track approximate token count during context assembly
+2. Prioritize facts by activation energy (higher energy = more relevant)
+3. Truncate lowest-priority facts when approaching budget
+4. Reserve space for response generation
 
-        let (sides, modifier) = if let Some((s, m)) = rest.split_once('+') {
-            (s.parse().ok()?, m.parse::<i8>().ok()?)
-        } else if let Some((s, m)) = rest.split_once('-') {
-            (s.parse().ok()?, -m.parse::<i8>().ok()?)
-        } else {
-            (rest.parse().ok()?, 0)
-        };
+### 3.2 LLM Output Validation
 
-        Some(Self { count, sides, modifier })
-    }
-}
-```
+**Missing**: Raw JSON parsing will fail on malformed LLM output.
 
-### 3.2 Unnecessary Cloning
+**Solution concept**:
+1. Validate against JSON schema before parsing
+2. Retry with simplified prompt on failure
+3. Fall back to templated response after N retries
 
-**Issue**: `spread_activation` clones tags unnecessarily.
+### 3.3 Deterministic Behavior
 
-```rust
-for (tag, energy) in hot_tags {
-    // ...
-    .map(|(t, e)| (t.clone(), e))
-```
+**Issue**: HashMap iteration order varies between runs.
 
-**Fix**: Use references where possible, or consider `Cow<'a, Tag>`.
+**Impact**: Same input can produce different spreading activation results.
 
-### 3.3 Partial Comparisons with `unwrap()`
-
-**Issue**:
-```rust
-tags.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-```
-
-**Problem**: Panics on NaN.
-
-**Fix**:
-```rust
-tags.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-// Or use total_cmp for f32 (Rust 1.62+):
-tags.sort_by(|a, b| b.1.total_cmp(&a.1));
-```
-
-### 3.4 Use `entry` API Properly
-
-**Issue**:
-```rust
-self.tag_to_facts
-    .entry(tag.clone())
-    .or_insert_with(HashSet::new)
-    .insert(id);
-```
-
-**Fix**: Use `or_default()`:
-```rust
-self.tag_to_facts.entry(tag.clone()).or_default().insert(id);
-```
-
-### 3.5 Avoid String Allocation in Hot Paths
-
-**Issue**: `Tag::as_string()` allocates every call.
-
-**Fix**: Consider interning or returning `Cow`:
-```rust
-pub fn as_str(&self) -> Cow<'_, str> {
-    match self {
-        Tag::Entity(id) => Cow::Owned(format!("entity:{}", id.0)),
-        Tag::Concept(s) => Cow::Borrowed(s.as_str()),
-        // ...
-    }
-}
-```
+**Solution**: Use IndexMap for graph structures to ensure reproducible behavior.
 
 ---
 
-## 4. Missing Critical Components
+## 4. Simplification Opportunities
 
-### 4.1 No Prompt Token Counting
+### 4.1 Start Without Localization
 
-**Problem**: No mechanism to ensure prompts fit in context window.
+The `rust-i18n` integration adds complexity. For MVP:
+- English only
+- Static strings
+- Add i18n via feature flag later
 
-**Fix**:
-```rust
-pub struct ContextBudget {
-    max_tokens: usize,
-    reserved_for_response: usize,
-}
-
-impl ContextAssembler {
-    pub fn assemble_within_budget(
-        &self,
-        event: &GameEvent,
-        graph: &KnowledgeGraph,
-        world_state: &WorldState,
-        budget: &ContextBudget,
-    ) -> AssembledContext {
-        // Prioritize facts by importance, truncate when budget exceeded
-        // Use tiktoken-rs or approximate 4 chars = 1 token
-    }
-}
-```
-
-### 4.2 No Graceful Degradation
-
-**Problem**: System fails completely if LLM is unavailable.
-
-The `generate_fallback_response` exists but isn't integrated into the main flow.
-
-**Fix**: Integrate fallback in `EventProcessor`:
-```rust
-pub async fn process_event(&mut self, event: GameEvent, world_state: &WorldState)
-    -> Result<ProcessorOutput, ProcessingError>
-{
-    match self.try_process_with_llm(&event, world_state).await {
-        Ok(output) => Ok(output),
-        Err(ProcessingError::LLMError(_)) => {
-            tracing::warn!("LLM unavailable, using fallback");
-            Ok(generate_fallback_response(&event))
-        }
-        Err(e) => Err(e),
-    }
-}
-```
-
-### 4.3 No Schema Validation for LLM Output
-
-**Problem**: `serde_json::from_str` will fail on malformed LLM output.
-
-**Fix**: Use `schemars` + validation:
-```rust
-use schemars::schema_for;
-use jsonschema::JSONSchema;
-
-lazy_static! {
-    static ref DIALOGUE_SCHEMA: JSONSchema = {
-        let schema = schema_for!(DialogueResponse);
-        JSONSchema::compile(&serde_json::to_value(schema).unwrap()).unwrap()
-    };
-}
-
-fn parse_with_validation<T: DeserializeOwned + JsonSchema>(content: &str) -> Result<T, ParseError> {
-    let value: Value = serde_json::from_str(content)?;
-    // Validate before deserialize
-    if let Err(errors) = DIALOGUE_SCHEMA.validate(&value) {
-        return Err(ParseError::SchemaValidation(errors.collect()));
-    }
-    serde_json::from_value(value).map_err(Into::into)
-}
-```
-
----
-
-## 5. Simplification Opportunities
-
-### 5.1 Remove Redundant `FactType::Generic`
-
-If facts can be generic, the type system isn't providing value. Consider:
-```rust
-pub struct Fact {
-    // Always have structured type
-    pub fact_type: FactType,  // No Generic variant
-    // Or use optional specific fields
-    pub relationship: Option<RelationshipData>,
-    pub secret: Option<SecretData>,
-}
-```
-
-### 5.2 Simplify Localization
-
-If this is a single-developer project, `rust-i18n` adds complexity. Consider:
-- Start with English only
-- Use `&'static str` for built-in text
-- Add i18n later via feature flag
-
-### 5.3 Storage: Just Use JSON
+### 4.2 JSON for Storage
 
 Bincode is faster but:
-- Not human-readable
+- Not human-readable (hard to debug)
 - Version migration is painful
-- Debugging is harder
+- Saves are read once per session
 
-For saves that are read once per session, JSON overhead is negligible.
+JSON overhead is negligible for this use case.
 
----
+### 4.3 Minimal Fact Types
 
-## 6. Project Feasibility Assessment
-
-### Realistic Scope for Solo Development
-
-| Component | Complexity | Time Estimate |
-|-----------|------------|---------------|
-| `dnd_rules` types | Low | Weeks |
-| Knowledge graph | Medium | Weeks |
-| Context assembler | Medium | Weeks |
-| Ollama integration | Low | Days |
-| Tool system | Medium | Weeks |
-| Bevy integration | High | Months |
-| Content (bestiary, etc.) | High | Ongoing |
-
-### Suggested MVP Path
-
-1. **Phase 1**: Core loop
-   - Hardcode world state
-   - Simple prompt template
-   - Ollama chat (no tools)
-   - Text output only
-
-2. **Phase 2**: Memory
-   - Knowledge graph
-   - Spreading activation
-   - One tool (add_fact)
-
-3. **Phase 3**: Structure
-   - Typed responses
-   - Full tool system
-   - Bestiary loading
-
-4. **Phase 4**: Game
-   - Bevy integration
-   - Combat system
-   - Save/load
+The architecture defines many `FactType` variants. For MVP:
+- Start with 2-3 types (Relationship, Event, Trait)
+- Add types as needed
+- Avoid Generic catch-all (defeats type safety)
 
 ---
 
-## 7. Critical Questions
+## 5. Implementation Roadmap
 
-1. **Combat AI latency**: 14B model needs ~2-5s per response. Is turn-based acceptable?
+### MVP Path (Recommended)
 
-2. **Context window pressure**: With 4k tokens, you have ~2500 for context + ~1500 for response. Is that enough for complex scenarios?
+**Phase 1: Proof of Concept**
+- Hardcoded world state (no persistence)
+- Simple prompt template
+- Ollama chat without tools
+- Text output only
 
-3. **Dialogue branching**: How deep? Each branch multiplies complexity.
+**Phase 2: Memory System**
+- Knowledge graph with spreading activation
+- Single tool: `add_fact`
+- Token budget limiting
 
-4. **Content pipeline**: Who writes the bestiary, items, initial facts? This is likely the biggest bottleneck.
+**Phase 3: Structured Output**
+- Typed JSON responses
+- Full tool system
+- Bestiary loading from TOML/JSON
+
+**Phase 4: Game Integration**
+- Bevy ECS integration
+- Combat system
+- Save/load persistence
 
 ---
 
-## 8. Summary of Required Changes
+## 6. Dialogue Branching Design
 
-### Must Fix (Correctness)
-- [ ] Define `StorageError` type
-- [ ] Fix `FactId` type inconsistency (u32 vs Uuid)
-- [ ] Handle async/sync runtime boundary
-- [ ] Add token budget limiting
+### Current Architecture (from ARCHITECTURE.md)
 
-### Should Fix (Robustness)
-- [ ] Use `IndexMap` for deterministic iteration
-- [ ] Add LLM output validation
-- [ ] Integrate fallback responses
-- [ ] Replace `todo!()` with implementation
+The system uses `DialogueResponse` with `player_variants: Vec<DialogVariant>`. AI generates options, player selects one.
 
-### Consider (Polish)
-- [ ] Use `NonZeroU32` for IDs
-- [ ] Use `total_cmp` for f32 sorting
-- [ ] Reduce cloning in hot paths
-- [ ] Simplify localization for MVP
+```rust
+pub struct DialogVariant {
+    pub text: String,
+    pub tone: EmotionalTone,
+    pub consequence_hint: Option<String>,
+}
+```
+
+### Branching Strategy: AI-Controlled Termination
+
+**Approach**: Let AI decide when dialogue should end, with player override.
+
+1. **Natural endings**: AI returns empty `player_variants` when conversation reaches natural conclusion
+2. **Player override**: Always include a "leave/end conversation" option as final variant
+3. **Depth limiting**: Track dialogue turn count, bias AI toward conclusion after N turns
+
+```rust
+pub struct DialogueState {
+    pub turn_count: u32,
+    pub max_turns_hint: u32,  // Soft limit, AI can exceed
+    pub force_conclusion: bool,  // Hard limit reached
+}
+
+pub struct DialogVariant {
+    pub text: String,
+    pub tone: EmotionalTone,
+    pub consequence_hint: Option<String>,
+    pub ends_dialogue: bool,  // New: marks this as exit option
+}
+```
+
+**System prompt injection**:
+- At turn N-2: "This conversation is reaching a natural point to conclude. Consider wrapping up."
+- At turn N: "Generate final response. Player variants should include conclusion options."
+
+### Branching Complexity
+
+Each dialogue turn generates 2-4 variants. Tree explosion is mitigated by:
+
+1. **No branching memory**: Each response is independent; AI doesn't track "paths"
+2. **State in knowledge graph**: Consequences are facts, not branches
+3. **Player choice → event → new context**: Linear, not tree
+
+**Example flow**:
+```
+Turn 1: AI generates 3 options
+Player picks option 2
+→ GameEvent::DialogueChoice emitted
+→ Knowledge graph updated with choice consequence
+→ Turn 2: AI sees updated facts, generates new options
+```
+
+This is a **state machine**, not a **dialogue tree**. Complexity is O(n) per turn, not O(branches^n).
+
+---
+
+## 7. Content Pipeline
+
+### Strategy: D&D SRD Foundation + AI Enhancement
+
+**Phase 1: Hand-written foundation**
+- Core bestiary from D&D 5e SRD (goblins, orcs, dragons, etc.)
+- Basic item definitions from SRD
+- Initial world facts (locations, major NPCs)
+
+**Phase 2: AI-assisted content**
+- Generate unique names for generic entities ("Goblin" → "Skrix the Toothless")
+- Generate flavor descriptions from stat blocks
+- Create personality traits from creature type
+- Generate lore connections from bestiary tags
+
+**Data format**:
+```toml
+# bestiary/goblin_warrior.toml
+[base]
+template = "srd:goblin"  # Reference SRD stats
+
+[generation]
+name_style = "goblin"
+generate_description = true
+personality_count = 2
+
+[overrides]
+# Only specify deviations from SRD
+hp_modifier = 5
+```
+
+**AI generation is lazy**: Descriptions generated on first encounter, cached in knowledge graph. Reduces startup time, spreads compute cost.
+
+---
+
+## 8. Summary
+
+### Core Architecture: Sound
+
+The spreading activation RAG approach is well-designed:
+- Tags extracted from events → associations traversed → relevant facts collected
+- Energy decay ensures focus on directly related content
+- Configurable thresholds allow tuning context relevance
+
+### Key Architectural Decisions
+
+| Decision | Recommendation |
+|----------|---------------|
+| Model | Ministral-8B or Qwen2.5-7B (not 14B) |
+| Context window | 16k tokens minimum |
+| Dialogue branching | State machine, not tree |
+| Content pipeline | SRD foundation + lazy AI generation |
+| Turn-based combat | Acceptable (2-5s latency) |
+
+### Implementation Priorities
+
+**Phase 1: Core loop (MVP)**
+- Hardcoded world state
+- Simple prompt template
+- Ollama chat (no tools)
+- Text output only
+
+**Phase 2: Memory system**
+- Knowledge graph with spreading activation
+- One tool (`add_fact`)
+- Token budget limiting
+
+**Phase 3: Structure**
+- Typed JSON responses
+- Full tool system
+- Bestiary loading from TOML
+
+**Phase 4: Game integration**
+- Bevy ECS integration
+- Combat system
+- Save/load
+
+### Code Quality Notes
+
+Minor Rust patterns to address during implementation:
+- Use `IndexMap` for deterministic iteration in graph traversal
+- Use `total_cmp` for f32 sorting (avoid NaN panics)
+- Define proper error types (`StorageError`, `ProcessingError`)
+- Resolve `FactId` type inconsistency (u32 vs Uuid in different places)
