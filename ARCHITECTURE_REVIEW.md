@@ -3,346 +3,407 @@
 ## Summary
 
 Reviewed: ARCHITECTURE.md for RAG-based LLM engine for AI-Dungeon style DnD5e roguelike.
-Target: 16GB VRAM, local LLM inference.
+Target: RX 9070 XT (16GB VRAM), local LLM inference via llama.cpp/GGUF.
 
-**Verdict**: Feasible. Core spreading activation RAG concept is solid. Model selection requires careful consideration for context budget.
+**Verdict**: Feasible. Core spreading activation RAG concept is solid. Ministral-3-14B is the recommended model.
 
 ---
 
-## 1. Hardware Feasibility & Model Selection
+## 1. Model Selection: Qwen3-14B vs Ministral-3-14B
 
-### Context Budget Problem
+### Benchmark Comparison (Late 2025)
 
-With a 4k context window, the budget splits approximately:
-- ~2500 tokens for context (facts, world state, characters)
-- ~1500 tokens for response
+| Benchmark | Ministral-3-14B | Qwen3-14B | Winner |
+|-----------|-----------------|-----------|--------|
+| AIME25 (Math Reasoning) | 85.0 | 73.7 | Ministral |
+| LiveCodeBench (Coding/JSON) | 64.6 | 59.3 | Ministral |
+| Arena Hard (Instruction Following) | 55.1 | 42.7 | Ministral |
+| GPQA Diamond | 71.2 | 66.3 | Ministral |
+| MATH Maj@1 | ~90.4 | ~85 | Ministral |
 
-**This is insufficient for complex fantasy scenarios.** A typical scenario requires:
+### Analysis
+
+**Ministral-3-14B wins on all key metrics.** This is unusual—"creative" models typically sacrifice logical precision. The benchmark data suggests Mistral has successfully combined both capabilities.
+
+**Why Ministral-3-14B for D&D DM Engine:**
+
+1. **Reasoning + Creativity**: D&D requires both narrative prose AND complex logic (deciding what facts to save, resolving game mechanics, tracking state). Ministral excels at both.
+
+2. **JSON/Structured Output**: Higher LiveCodeBench score indicates better structured output generation—critical for tool calls and fact extraction.
+
+3. **Writing Style**: Mistral models are known for "literary/novelistic" prose. Qwen tends toward concise, logical output—acceptable but less immersive for storytelling.
+
+4. **Thinking Mode**: Both models support chain-of-thought reasoning. Ministral-3-14B-Reasoning-2512 variant has extended thinking capabilities.
+
+### VRAM Budget (Ministral-3-14B)
+
+| Quantization | Model Size | KV Cache (16k ctx) | Total VRAM |
+|--------------|------------|-------------------|------------|
+| Q4_K_M | ~9GB | ~3GB | ~12-13GB |
+| Q5_K_M | ~10.5GB | ~3GB | ~14-15GB |
+| Q6_K | ~12GB | ~3GB | ~16GB (tight) |
+
+**Recommendation: Q5_K_M quantization**
+- Quality loss minimal (~3% vs FP16)
+- Leaves ~1-2GB headroom for system overhead
+- 16k context comfortable; 32k possible with Q4_K_M
+
+---
+
+## 2. Architecture Decision: Single vs Dual Model
+
+### Option A: Single 14B Model (Everything)
+
+One Ministral-3-14B (Q5_K_M) handles both narrative generation AND fact extraction.
+
+**Approach 1: Single Pass**
+```
+User Action → [Ministral-14B] → Narrative + JSON extraction in one response
+```
+
+**Approach 2: Two-Pass**
+```
+User Action → [Ministral-14B] → Narrative → [Ministral-14B] → JSON extraction
+```
+
+**Pros:**
+- Simpler architecture, one model to optimize
+- Full context available for extraction decisions
+- No VRAM fragmentation
+
+**Cons:**
+- Single-pass requires model to context-switch mid-generation
+- Two-pass doubles latency (~4-10s total)
+
+### Option B: Dual Model (14B + 3B)
+
+Ministral-3-14B for narrative; Llama-3.2-3B or Ministral-3-3B for extraction.
+
+```
+User Action → [Ministral-14B] → Narrative
+                    ↓
+             [3B Model] → Extract facts from narrative + context
+```
+
+**VRAM Split:**
+| Component | VRAM |
+|-----------|------|
+| Ministral-3-14B Q4_K_M | ~9GB |
+| Llama-3.2-3B Q4_K_M | ~2GB |
+| KV caches (both) | ~3-4GB |
+| **Total** | ~14-15GB |
+
+**Pros:**
+- 3B model runs in parallel while 14B generates
+- Lower latency for extraction (3B is fast)
+- Specialized models for specialized tasks
+
+**Cons:**
+- VRAM pressure—context windows limited
+- Two models to configure and prompt
+- Context not shared (3B sees narrative output, not full state)
+
+### Recommendation: Single Model, Two-Pass
+
+**Rationale:**
+
+1. **Context matters for extraction**: The 14B model needs full game state to decide what's "important enough" to save. A 3B model seeing only narrative output will miss context.
+
+2. **VRAM headroom**: Q5_K_M fits with 16k context comfortably. Dual model forces Q4_K_M with reduced context.
+
+3. **Latency is acceptable**: Turn-based gameplay tolerates 4-5s response time. Two-pass with 14B: ~2-3s narrative + ~1-2s extraction = ~4-5s total.
+
+4. **Simpler debugging**: One model, one prompt engineering workflow.
+
+**Implementation:**
+```
+Phase 1: Generate Narrative
+- Input: Game state, retrieved facts, player action
+- Output: Prose narrative for player
+
+Phase 2: Extract/Analyze
+- Input: Narrative + game state + extraction schema
+- Output: JSON with facts to persist, state changes
+- Use GBNF grammar to force valid JSON
+```
+
+---
+
+## 3. Structured Outputs vs Model Intelligence
+
+### The Question
+
+> Does having a "smarter" model matter if I'm forcing JSON syntax via GBNF grammar?
+
+### Answer: Yes, Intelligence Still Matters
+
+**GBNF guarantees syntactic validity, not semantic correctness.**
+
+Example prompt: "Extract important facts from this scene."
+
+**Dumber model with GBNF:**
+```json
+{
+  "facts": [
+    {"content": "The tavern exists", "importance": 0.9},
+    {"content": "There is a door", "importance": 0.8}
+  ]
+}
+```
+Valid JSON. Useless facts.
+
+**Smarter model with GBNF:**
+```json
+{
+  "facts": [
+    {"content": "Merchant Aldric owes 500 gold to the Crown", "importance": 0.95},
+    {"content": "Aldric's daughter is secretly a mage", "importance": 0.85}
+  ]
+}
+```
+Valid JSON. Narratively significant facts.
+
+### What Intelligence Affects
+
+| Aspect | Grammar Impact | Intelligence Impact |
+|--------|---------------|---------------------|
+| JSON syntax | Guaranteed by GBNF | N/A |
+| Field names correct | Guaranteed by schema | N/A |
+| Value types match | Guaranteed by schema | N/A |
+| **Value content quality** | No impact | Critical |
+| **Logical consistency** | No impact | Critical |
+| **Relevance of decisions** | No impact | Critical |
+| **Hallucination rate** | No impact | Higher IQ = less |
+
+### GBNF Limitations
+
+1. **Cannot force semantic coherence**: Grammar can require a string; can't require the string makes sense.
+
+2. **Cannot prevent hallucination**: Model can confidently output incorrect facts in valid JSON.
+
+3. **Cannot enforce logic**: "If X then Y" reasoning happens in the model, not the grammar.
+
+### Recommendation
+
+Use GBNF/structured outputs AND a high-reasoning model:
+
+- **GBNF**: Eliminates malformed responses, simplifies parsing
+- **High-reasoning model (Ministral-3-14B)**: Ensures extracted content is meaningful
+
+The 85% AIME25 score matters because it indicates the model can reason about what's important, what's connected, and what to save—not just generate syntactically valid output.
+
+---
+
+## 4. Token Budget Analysis
+
+### Fantasy RPG Scenario Requirements
 
 | Context Component | Token Estimate |
 |-------------------|----------------|
-| System prompt + response schema | ~300-500 |
-| Current event description | ~100-200 |
-| World state (time, location, weather) | ~50-100 |
-| Active characters (2-4 NPCs) | ~200-400 |
-| Relevant facts from knowledge graph | ~500-1500 |
-| Dialogue history (last 2-3 turns) | ~300-600 |
-| **Total context needed** | **~1500-3300** |
-| Reserved for response | ~1000-2000 |
-| **Minimum practical context** | **~3000-5000** |
+| System prompt + JSON schema | 400-600 |
+| Current scene description | 150-250 |
+| World state (time, weather, location) | 50-100 |
+| Active characters (3-5 NPCs) | 300-500 |
+| Retrieved facts (knowledge graph) | 800-1500 |
+| Dialogue history (last 3 turns) | 400-700 |
+| **Total Input** | **2100-3650** |
+| Response (narrative + thinking) | 1000-2500 |
+| **Total Context Window Needed** | **4000-6000** |
 
-For complex scenarios (combat with multiple participants, revelation moments, branching dialogue):
-- Need ~4000-6000 tokens context
-- Need ~1500-2500 tokens response
-- **Minimum practical window: 6k-8k tokens**
+For complex scenes (combat, revelations, multi-NPC dialogue): **8k-12k tokens ideal.**
 
-### Model Comparison (16GB VRAM)
+### VRAM Calculation
 
-| Model | Params | Q4_K_M Size | Max Practical Context | Quality |
-|-------|--------|-------------|----------------------|---------|
-| Qwen2.5-14B | 14B | ~8.5GB | 4-6k (tight) | High |
-| Qwen2.5-7B | 7B | ~4.5GB | 8-16k (comfortable) | Medium-High |
-| Ministral-8B | 8B | ~5GB | 8-32k (comfortable) | Medium-High |
-| Ministral-3B | 3B | ~2GB | 16-64k (very comfortable) | Medium |
+Ministral-3-14B Q5_K_M with 16k context on RX 9070 XT:
 
-### Recommendation: Ministral-8B or Qwen2.5-7B
-
-**Why not Qwen2.5-14B?**
-- At Q4_K_M (~8.5GB), leaves only ~7.5GB for KV cache
-- 8k context KV cache needs ~3GB, leaving ~4.5GB headroom
-- Complex scenarios will hit VRAM ceiling, causing swap to RAM (5-20x slowdown)
-
-**Why Ministral-8B?**
-- Native 256k context window (can use 16-32k comfortably)
-- Q4_K_M fits in ~5GB, leaves ~11GB for KV cache
-- 16k context with 8B model: ~2.5GB KV cache
-- **Total: ~7.5GB with 16k context - plenty of headroom**
-- Apache 2.0 license, optimized for edge deployment
-
-**Why Qwen2.5-7B as alternative?**
-- Strong multilingual support (29+ languages)
-- Excellent at structured JSON output
-- Good balance of quality vs context capacity
-
-### VRAM Budget (Recommended Setup)
-
-| Component | VRAM (Ministral-8B Q4_K_M) |
-|-----------|---------------------------|
-| Model weights | ~5GB |
-| KV cache (16k context) | ~2.5GB |
-| KV cache (32k context) | ~5GB |
+| Component | VRAM |
+|-----------|------|
+| Model weights (Q5_K_M) | ~10.5GB |
+| KV cache (16k context) | ~3-3.5GB |
 | Overhead/buffers | ~1GB |
-| **Total (16k ctx)** | **~8.5GB** |
-| **Total (32k ctx)** | **~11GB** |
+| **Total** | **~14.5-15GB** |
 
-**Assessment**: 16k context is comfortable. 32k possible. This solves the context budget problem.
-
----
-
-## 2. Core Architectural Concepts
-
-### 2.1 Spreading Activation RAG
-
-The knowledge graph uses spreading activation to find relevant facts. This is the right approach for:
-- Limited context windows (retrieves only what's needed)
-- Associative memory (finds related facts through connections)
-- Emergent narrative (unexpected connections surface naturally)
-
-**Key insight**: This is not a traditional vector-based RAG. Tag associations form a semantic graph where energy flows from trigger tags to related concepts. The architecture correctly prioritizes graph traversal over embedding similarity.
-
-### 2.2 Event-Driven Pipeline
-
-```
-GameEvent → ContextAssembler → LLM → ToolExecutor → Response
-                ↓                        ↓
-           KnowledgeGraph ←──────────────┘
-```
-
-**Strength**: Clean separation. The core processes events without controlling game flow.
-
-**Consideration**: Async boundary with Bevy needs careful handling. Use `bevy_tokio_tasks` or channels rather than blocking runtime.
-
-### 2.3 Typed Response System
-
-The architecture defines typed responses (`DialogueResponse`, `CombatResponse`, `DescriptionResponse`) rather than free-form text.
-
-**Benefits**:
-- Structured output for game integration
-- JSON schema guides LLM output
-- Validation catches malformed responses
-
-**Consideration**: Add fallback to graceful degradation. When LLM returns invalid JSON, fall back to templated responses rather than crashing.
+**Verdict**: Fits with ~1GB headroom. Safe.
 
 ---
 
-## 3. Architectural Gaps
+## 5. Dialogue Branching Design
 
-### 3.1 Token Budget Management
+### Architecture (from ARCHITECTURE.md)
 
-**Missing**: No mechanism to ensure assembled context fits in context window.
+State machine, not dialogue tree. AI generates 2-4 player options per turn; consequences stored as facts.
 
-**Solution concept**:
-1. Track approximate token count during context assembly
-2. Prioritize facts by activation energy (higher energy = more relevant)
-3. Truncate lowest-priority facts when approaching budget
-4. Reserve space for response generation
+### AI-Controlled Termination
 
-### 3.2 LLM Output Validation
+1. **Natural endings**: AI returns `ends_dialogue: true` on final variant when conversation concludes naturally
+2. **Player escape**: Always include a "leave conversation" option
+3. **Depth biasing**: At turn N-2, inject hint to wrap up; at turn N, force conclusion options
 
-**Missing**: Raw JSON parsing will fail on malformed LLM output.
-
-**Solution concept**:
-1. Validate against JSON schema before parsing
-2. Retry with simplified prompt on failure
-3. Fall back to templated response after N retries
-
-### 3.3 Deterministic Behavior
-
-**Issue**: HashMap iteration order varies between runs.
-
-**Impact**: Same input can produce different spreading activation results.
-
-**Solution**: Use IndexMap for graph structures to ensure reproducible behavior.
+**Complexity**: O(n) per turn. No branch explosion because state lives in knowledge graph, not in conversation tree.
 
 ---
 
-## 4. Simplification Opportunities
+## 6. Content Pipeline
 
-### 4.1 Start Without Localization
+### Strategy: D&D SRD + Lazy AI Generation
 
-The `rust-i18n` integration adds complexity. For MVP:
-- English only
-- Static strings
-- Add i18n via feature flag later
+**Hand-written (SRD foundation):**
+- Bestiary stat blocks from D&D 5e SRD
+- Item definitions
+- Core world facts, major locations
 
-### 4.2 JSON for Storage
+**AI-generated (on first encounter):**
+- Unique names for generic creatures
+- Personality traits, descriptions
+- Lore connections
 
-Bincode is faster but:
-- Not human-readable (hard to debug)
-- Version migration is painful
-- Saves are read once per session
-
-JSON overhead is negligible for this use case.
-
-### 4.3 Minimal Fact Types
-
-The architecture defines many `FactType` variants. For MVP:
-- Start with 2-3 types (Relationship, Event, Trait)
-- Add types as needed
-- Avoid Generic catch-all (defeats type safety)
-
----
-
-## 5. Implementation Roadmap
-
-### MVP Path (Recommended)
-
-**Phase 1: Proof of Concept**
-- Hardcoded world state (no persistence)
-- Simple prompt template
-- Ollama chat without tools
-- Text output only
-
-**Phase 2: Memory System**
-- Knowledge graph with spreading activation
-- Single tool: `add_fact`
-- Token budget limiting
-
-**Phase 3: Structured Output**
-- Typed JSON responses
-- Full tool system
-- Bestiary loading from TOML/JSON
-
-**Phase 4: Game Integration**
-- Bevy ECS integration
-- Combat system
-- Save/load persistence
-
----
-
-## 6. Dialogue Branching Design
-
-### Current Architecture (from ARCHITECTURE.md)
-
-The system uses `DialogueResponse` with `player_variants: Vec<DialogVariant>`. AI generates options, player selects one.
-
-```rust
-pub struct DialogVariant {
-    pub text: String,
-    pub tone: EmotionalTone,
-    pub consequence_hint: Option<String>,
-}
-```
-
-### Branching Strategy: AI-Controlled Termination
-
-**Approach**: Let AI decide when dialogue should end, with player override.
-
-1. **Natural endings**: AI returns empty `player_variants` when conversation reaches natural conclusion
-2. **Player override**: Always include a "leave/end conversation" option as final variant
-3. **Depth limiting**: Track dialogue turn count, bias AI toward conclusion after N turns
-
-```rust
-pub struct DialogueState {
-    pub turn_count: u32,
-    pub max_turns_hint: u32,  // Soft limit, AI can exceed
-    pub force_conclusion: bool,  // Hard limit reached
-}
-
-pub struct DialogVariant {
-    pub text: String,
-    pub tone: EmotionalTone,
-    pub consequence_hint: Option<String>,
-    pub ends_dialogue: bool,  // New: marks this as exit option
-}
-```
-
-**System prompt injection**:
-- At turn N-2: "This conversation is reaching a natural point to conclude. Consider wrapping up."
-- At turn N: "Generate final response. Player variants should include conclusion options."
-
-### Branching Complexity
-
-Each dialogue turn generates 2-4 variants. Tree explosion is mitigated by:
-
-1. **No branching memory**: Each response is independent; AI doesn't track "paths"
-2. **State in knowledge graph**: Consequences are facts, not branches
-3. **Player choice → event → new context**: Linear, not tree
-
-**Example flow**:
-```
-Turn 1: AI generates 3 options
-Player picks option 2
-→ GameEvent::DialogueChoice emitted
-→ Knowledge graph updated with choice consequence
-→ Turn 2: AI sees updated facts, generates new options
-```
-
-This is a **state machine**, not a **dialogue tree**. Complexity is O(n) per turn, not O(branches^n).
-
----
-
-## 7. Content Pipeline
-
-### Strategy: D&D SRD Foundation + AI Enhancement
-
-**Phase 1: Hand-written foundation**
-- Core bestiary from D&D 5e SRD (goblins, orcs, dragons, etc.)
-- Basic item definitions from SRD
-- Initial world facts (locations, major NPCs)
-
-**Phase 2: AI-assisted content**
-- Generate unique names for generic entities ("Goblin" → "Skrix the Toothless")
-- Generate flavor descriptions from stat blocks
-- Create personality traits from creature type
-- Generate lore connections from bestiary tags
-
-**Data format**:
+**Data format:**
 ```toml
-# bestiary/goblin_warrior.toml
+# bestiary/goblin.toml
 [base]
-template = "srd:goblin"  # Reference SRD stats
+template = "srd:goblin"
 
 [generation]
 name_style = "goblin"
 generate_description = true
 personality_count = 2
-
-[overrides]
-# Only specify deviations from SRD
-hp_modifier = 5
 ```
 
-**AI generation is lazy**: Descriptions generated on first encounter, cached in knowledge graph. Reduces startup time, spreads compute cost.
+Lazy generation reduces startup time and spreads compute cost across gameplay.
+
+---
+
+## 7. Implementation Roadmap
+
+### Phase 1: Proof of Concept (Core Loop)
+
+**Goal**: Player action → AI narrative response
+
+**Tasks:**
+1. Set up llama.cpp with Ministral-3-14B Q5_K_M GGUF
+2. Create basic prompt template with system instructions
+3. Implement simple CLI: player types action, AI responds
+4. Test narrative quality and response latency
+
+**Deliverable**: Interactive text game, no persistence
+
+**Validation**:
+- Response latency <3s for narrative generation
+- Prose quality subjectively acceptable
+- VRAM usage stable under 15GB
+
+---
+
+### Phase 2: Structured Output & Fact Extraction
+
+**Goal**: AI extracts and persists important facts
+
+**Tasks:**
+1. Define JSON schema for fact extraction
+2. Implement GBNF grammar for extraction response
+3. Two-pass generation: narrative → extraction
+4. Test fact quality (relevance, consistency)
+
+**Deliverable**: Facts extracted and logged per turn
+
+**Validation**:
+- 100% valid JSON output (GBNF guarantees syntax)
+- >80% of extracted facts are narratively relevant
+- Combined latency <6s (narrative + extraction)
+
+---
+
+### Phase 3: Knowledge Graph & RAG
+
+**Goal**: Context-aware generation using spreading activation
+
+**Tasks:**
+1. Implement knowledge graph (IndexMap for determinism)
+2. Implement spreading activation retrieval
+3. Integrate retrieved facts into narrative prompt
+4. Token budget management (prioritize by activation energy)
+
+**Deliverable**: AI responses informed by accumulated world state
+
+**Validation**:
+- References past events appropriately
+- No context overflow (token budget enforced)
+- Deterministic behavior (same seed → same results)
+
+---
+
+### Phase 4: Game Mechanics & Combat
+
+**Goal**: D&D 5e combat integration
+
+**Tasks:**
+1. Load bestiary from TOML (SRD creatures)
+2. Implement turn-based combat loop
+3. AI selects creature actions based on context
+4. Combat narrative generation
+
+**Deliverable**: Functional combat encounters
+
+**Validation**:
+- Combat follows D&D 5e SRD rules
+- AI tactical decisions are reasonable
+- Combat latency acceptable (~3-5s per turn)
+
+---
+
+### Phase 5: Bevy Integration & Persistence
+
+**Goal**: Full game engine integration
+
+**Tasks:**
+1. Bevy ECS components for game entities
+2. WorldContext snapshot → narrative_core
+3. Save/load knowledge graph (JSON format)
+4. Async LLM calls (channels or bevy_tokio_tasks)
+
+**Deliverable**: Playable game prototype
 
 ---
 
 ## 8. Summary
 
-### Core Architecture: Sound
+### Model Selection
 
-The spreading activation RAG approach is well-designed:
-- Tags extracted from events → associations traversed → relevant facts collected
-- Energy decay ensures focus on directly related content
-- Configurable thresholds allow tuning context relevance
+| Factor | Recommendation |
+|--------|---------------|
+| **Model** | Ministral-3-14B-Reasoning-2512 |
+| **Quantization** | Q5_K_M (~10.5GB) |
+| **Context window** | 16k tokens |
+| **Architecture** | Single model, two-pass |
 
-### Key Architectural Decisions
+### Key Technical Decisions
 
-| Decision | Recommendation |
-|----------|---------------|
-| Model | Ministral-8B or Qwen2.5-7B (not 14B) |
-| Context window | 16k tokens minimum |
-| Dialogue branching | State machine, not tree |
-| Content pipeline | SRD foundation + lazy AI generation |
-| Turn-based combat | Acceptable (2-5s latency) |
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Model | Ministral-3-14B | Wins all benchmarks; literary prose + strong reasoning |
+| Single vs Dual | Single model | Context matters for extraction; simpler debugging |
+| GBNF usage | Yes | Guarantees syntax; model intelligence handles semantics |
+| Quantization | Q5_K_M | Best quality/VRAM balance for 16GB |
 
-### Implementation Priorities
+### Why Ministral-3-14B Over Qwen3-14B
 
-**Phase 1: Core loop (MVP)**
-- Hardcoded world state
-- Simple prompt template
-- Ollama chat (no tools)
-- Text output only
+1. **+11.3 points on AIME25**: Better mathematical/logical reasoning
+2. **+5.3 points on LiveCodeBench**: Better structured output generation
+3. **+12.4 points on Arena Hard**: Better instruction following
+4. **Literary style**: More immersive prose for D&D narratives
+5. **Apache 2.0**: Fully open license
 
-**Phase 2: Memory system**
-- Knowledge graph with spreading activation
-- One tool (`add_fact`)
-- Token budget limiting
+### Implementation Priority
 
-**Phase 3: Structure**
-- Typed JSON responses
-- Full tool system
-- Bestiary loading from TOML
-
-**Phase 4: Game integration**
-- Bevy ECS integration
-- Combat system
-- Save/load
+1. Core loop (narrative generation)
+2. Structured extraction (GBNF + two-pass)
+3. Knowledge graph (spreading activation)
+4. Combat (SRD mechanics)
+5. Game integration (Bevy)
 
 ### Code Quality Notes
 
-Minor Rust patterns to address during implementation:
-- Use `IndexMap` for deterministic iteration in graph traversal
-- Use `total_cmp` for f32 sorting (avoid NaN panics)
-- Define proper error types (`StorageError`, `ProcessingError`)
-- Resolve `FactId` type inconsistency (u32 vs Uuid in different places)
+- Use `IndexMap` for deterministic graph traversal
+- Use `total_cmp` for f32 sorting
+- Define proper error types
+- JSON storage for human-readable saves
